@@ -25,6 +25,8 @@ use std::rc::Rc;
 use std::task::Context;
 use std::task::Poll;
 
+use crate::isolate::attach_handle_to_error;
+use crate::isolate::exception_to_err_result;
 use crate::isolate::Isolate;
 use crate::isolate::StartupData;
 use crate::module_specifier::ModuleSpecifier;
@@ -82,23 +84,6 @@ impl DerefMut for EsIsolate {
 
 unsafe impl Send for EsIsolate {}
 
-impl Drop for EsIsolate {
-  fn drop(&mut self) {
-    let isolate = self.core_isolate.v8_isolate.as_ref().unwrap();
-    // Clear persistent handles we own.
-    {
-      let mut locker = v8::Locker::new(&isolate);
-      let scope = locker.enter();
-      for module in self.modules.info.values_mut() {
-        module.handle.reset(scope);
-      }
-      for handle in self.dyn_import_map.values_mut() {
-        handle.reset(scope);
-      }
-    }
-  }
-}
-
 impl EsIsolate {
   pub fn new(
     loader: Rc<dyn Loader + Unpin>,
@@ -147,13 +132,14 @@ impl EsIsolate {
     name: &str,
     source: &str,
   ) -> Result<ModuleId, ErrBox> {
-    let isolate = self.core_isolate.v8_isolate.as_ref().unwrap();
-    let mut locker = v8::Locker::new(&isolate);
+    let core_isolate = &mut self.core_isolate;
+    let isolate = core_isolate.v8_isolate.as_mut().unwrap();
+    let js_error_create_fn = &*core_isolate.js_error_create_fn;
 
-    let mut hs = v8::HandleScope::new(locker.enter());
+    let mut hs = v8::HandleScope::new(isolate);
     let scope = hs.enter();
-    assert!(!self.core_isolate.global_context.is_empty());
-    let context = self.core_isolate.global_context.get(scope).unwrap();
+    assert!(!core_isolate.global_context.is_empty());
+    let context = core_isolate.global_context.get(scope).unwrap();
     let mut cs = v8::ContextScope::new(scope, context);
     let scope = cs.enter();
 
@@ -166,13 +152,15 @@ impl EsIsolate {
     let mut try_catch = v8::TryCatch::new(scope);
     let tc = try_catch.enter();
 
-    let maybe_module = v8::script_compiler::compile_module(&isolate, source);
+    let maybe_module = v8::script_compiler::compile_module(scope, source);
 
     if tc.has_caught() {
       assert!(maybe_module.is_none());
-      return self
-        .core_isolate
-        .exception_to_err_result(scope, tc.exception().unwrap());
+      return exception_to_err_result(
+        scope,
+        tc.exception().unwrap(),
+        js_error_create_fn,
+      );
     }
 
     let module = maybe_module.unwrap();
@@ -201,9 +189,10 @@ impl EsIsolate {
   /// the V8 exception. By default this type is CoreJSError, however it may be a
   /// different type if Isolate::set_js_error_create() has been used.
   fn mod_instantiate(&mut self, id: ModuleId) -> Result<(), ErrBox> {
-    let isolate = self.core_isolate.v8_isolate.as_ref().unwrap();
-    let mut locker = v8::Locker::new(isolate);
-    let mut hs = v8::HandleScope::new(locker.enter());
+    let isolate = self.core_isolate.v8_isolate.as_mut().unwrap();
+    let js_error_create_fn = &*self.core_isolate.js_error_create_fn;
+
+    let mut hs = v8::HandleScope::new(isolate);
     let scope = hs.enter();
     assert!(!self.core_isolate.global_context.is_empty());
     let context = self.core_isolate.global_context.get(scope).unwrap();
@@ -221,7 +210,11 @@ impl EsIsolate {
     let mut module = module_info.handle.get(scope).unwrap();
 
     if module.get_status() == v8::ModuleStatus::Errored {
-      self.exception_to_err_result(scope, module.get_exception())?
+      exception_to_err_result(
+        scope,
+        module.get_exception(),
+        js_error_create_fn,
+      )?
     }
 
     let result =
@@ -230,7 +223,7 @@ impl EsIsolate {
       Some(_) => Ok(()),
       None => {
         let exception = tc.exception().unwrap();
-        self.exception_to_err_result(scope, exception)
+        exception_to_err_result(scope, exception, js_error_create_fn)
       }
     }
   }
@@ -241,9 +234,10 @@ impl EsIsolate {
     &mut self,
     id: ModuleId,
   ) -> Result<(), ErrBox> {
-    let isolate = self.core_isolate.v8_isolate.as_ref().unwrap();
-    let mut locker = v8::Locker::new(isolate);
-    let mut hs = v8::HandleScope::new(locker.enter());
+    let isolate = self.core_isolate.v8_isolate.as_mut().unwrap();
+    let js_error_create_fn = &*self.core_isolate.js_error_create_fn;
+
+    let mut hs = v8::HandleScope::new(isolate);
     let scope = hs.enter();
     assert!(!self.core_isolate.global_context.is_empty());
     let context = self.core_isolate.global_context.get(scope).unwrap();
@@ -271,10 +265,9 @@ impl EsIsolate {
     match status {
       v8::ModuleStatus::Evaluated => Ok(()),
       v8::ModuleStatus::Errored => {
-        let i = &mut self.core_isolate;
         let exception = module.get_exception();
-        i.exception_to_err_result(scope, exception)
-          .map_err(|err| i.attach_handle_to_error(scope, err, exception))
+        exception_to_err_result(scope, exception, js_error_create_fn)
+          .map_err(|err| attach_handle_to_error(scope, err, exception))
       }
       other => panic!("Unexpected module status {:?}", other),
     }
@@ -286,12 +279,14 @@ impl EsIsolate {
   /// the V8 exception. By default this type is CoreJSError, however it may be a
   /// different type if Isolate::set_js_error_create() has been used.
   pub fn mod_evaluate(&mut self, id: ModuleId) -> Result<(), ErrBox> {
-    let isolate = self.core_isolate.v8_isolate.as_ref().unwrap();
-    let mut locker = v8::Locker::new(isolate);
-    let mut hs = v8::HandleScope::new(locker.enter());
+    let core_isolate = &mut self.core_isolate;
+    let isolate = core_isolate.v8_isolate.as_mut().unwrap();
+    let js_error_create_fn = &*core_isolate.js_error_create_fn;
+
+    let mut hs = v8::HandleScope::new(isolate);
     let scope = hs.enter();
-    assert!(!self.core_isolate.global_context.is_empty());
-    let context = self.core_isolate.global_context.get(scope).unwrap();
+    assert!(!core_isolate.global_context.is_empty());
+    let context = core_isolate.global_context.get(scope).unwrap();
     let mut cs = v8::ContextScope::new(scope, context);
     let scope = cs.enter();
 
@@ -316,9 +311,8 @@ impl EsIsolate {
     match status {
       v8::ModuleStatus::Evaluated => Ok(()),
       v8::ModuleStatus::Errored => {
-        let i = &mut self.core_isolate;
         let exception = module.get_exception();
-        i.exception_to_err_result(scope, exception)
+        exception_to_err_result(scope, exception, js_error_create_fn)
       }
       other => panic!("Unexpected module status {:?}", other),
     }
@@ -362,11 +356,12 @@ impl EsIsolate {
     id: DynImportId,
     err: ErrBox,
   ) -> Result<(), ErrBox> {
-    let isolate = self.core_isolate.v8_isolate.as_ref().unwrap();
-    let mut locker = v8::Locker::new(isolate);
-    let mut hs = v8::HandleScope::new(locker.enter());
+    let core_isolate = &mut self.core_isolate;
+    let isolate = core_isolate.v8_isolate.as_mut().unwrap();
+
+    let mut hs = v8::HandleScope::new(isolate);
     let scope = hs.enter();
-    let context = self.core_isolate.global_context.get(scope).unwrap();
+    let context = core_isolate.global_context.get(scope).unwrap();
     let mut cs = v8::ContextScope::new(scope, context);
     let scope = cs.enter();
 
@@ -403,9 +398,8 @@ impl EsIsolate {
   ) -> Result<(), ErrBox> {
     debug!("dyn_import_done {} {:?}", id, mod_id);
     assert!(mod_id != 0);
-    let isolate = self.core_isolate.v8_isolate.as_ref().unwrap();
-    let mut locker = v8::Locker::new(isolate);
-    let mut hs = v8::HandleScope::new(locker.enter());
+    let isolate = self.core_isolate.v8_isolate.as_mut().unwrap();
+    let mut hs = v8::HandleScope::new(isolate);
     let scope = hs.enter();
     assert!(!self.core_isolate.global_context.is_empty());
     let context = self.core_isolate.global_context.get(scope).unwrap();
